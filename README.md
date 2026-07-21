@@ -279,6 +279,5 @@ const instance = axios.create({
 - [讯飞星火](https://xinghuo.xfyun.cn/)
 - [高德开放平台](https://lbs.amap.com/)
 
----
 
-🤖 *Generated with [Claude Code](https://claude.com/claude-code)*
+
