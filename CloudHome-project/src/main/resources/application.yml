@@ -1,0 +1,102 @@
+server:
+  port: 8023
+  address: 0.0.0.0
+
+spring:
+  # MySQL 数据库配置
+  datasource:
+    url: jdbc:mysql://localhost:3306/WiseGuardCloudHome-Project?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: root
+    password: 123
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  data:
+    # Redis 配置
+    redis:
+      port: 6379
+      host: localhost
+      timeout: 2000
+      database: 0
+
+    # MongoDB 配置
+    mongodb:
+      uri: mongodb://localhost:27017/CHome_chat_memory
+
+  # InfluxDB 数据库读取配置
+  influx:
+    token: kTCnhx0uHOOKaRNV9H0AU3d2kuDXcM4bS3a_59gnbPkHrUd52rPYwK2rJ_cl3leGrC3SlU0-v6Os0MhdmyXYnA==
+    org: CHome
+    bucket: CHome_Environment
+    url: http://localhost:8086
+    secret: "Bearer CHomeZjQthWjp"
+
+  # MQTT 配置
+  mqtt:
+    username: admin
+    password: THbxmh5119824
+    url: tcp://localhost
+    subClientId: CHome_sub_client
+    subTopic: CHome/sub/#
+    pubClientId: CHome_pub_client
+
+  # Spring ai 配置
+  ai:
+    openai:
+      api-key: 你的 api-key
+      base-url: https://api.deepseek.com
+      embedding:
+        enabled: false
+      chat:
+        options:
+          model: deepseek-chat
+
+# 第三方平台配置
+thirdparty:
+  # 星火ASR/TTS配置
+  spark:
+    ai:
+      appid:
+      appsecret:
+      appkey:
+      hosturlasr: https://iat.cn-huabei-1.xf-yun.com/v1
+      hosturltts: https://cbm01.cn-huabei-1.xf-yun.com/v1/private/mcd9m97e6
+      Speaker: x4_lingxiaoxuan_oral
+  # Coze 配置
+  coze:
+    token:
+    botId: 7508584717500071972
+  # 高德天气配置
+  gaode:
+    key:
+    output: json
+  # 阿里云 oss 存储配置
+  aliyun:
+    oss:
+      endpoint: oss-cn-beijing.aliyuncs.com
+      backet:
+      access-key-id:
+      access-key-secret:
+  # spug 短信/电话/.. 推送助手
+  spug:
+    base-url: https://push.spug.cc/send/
+    all-alarm:
+    wxmp-alarm:
+    sms-code:
+
+# TCP连接配置
+tcp:
+  port: 8183
+  host: 192.168.107.137
+  connectTimeOut: 10000
+  operationCode: AA 55 55 AA
+
+jwt:
+  secret: CHomeZjQthWjp
+  bearer-prefix: "CHome "
+
+# 验证码图片设置
+captcha:
+  image:
+    length: 4
+    width: 66
+    height: 22

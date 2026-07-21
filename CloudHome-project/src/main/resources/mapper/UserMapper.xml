@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.chome.mapper.UserMapper">
+
+    <insert id="saveUser" useGeneratedKeys="true" keyProperty="id">
+        insert into CHome_User(user_name, user_password, created_time, user_avatar)
+        values(#{user.userName},#{user.userPassword},#{user.createdTime},#{user.userAvatar})
+    </insert>
+
+    <update id="updateUserInfo">
+        update CHome_User
+        <set>
+            <if test="user.userName != null">user_name = #{user.userName},</if>
+            <if test="user.userGender != null">user_region = #{user.userGender},</if>
+            <if test="user.userAge != null">user_avatar = #{user.userAge},</if>
+            <if test="user.userRegion != null">user_gender = #{user.userRegion},</if>
+            <if test="user.userIpRegion != null">user_ip_gender = #{user.userIpRegion},</if>
+            <if test="user.userPhone != null">user_phone = #{user.userPhone},</if>
+            <if test="user.remark != null">user_birthday = #{user.remark},</if>
+            update_time = now()
+        </set>
+        where user_id = #{id}
+    </update>
+
+    <update id="updateIpRegion">
+        update CHome_User
+        set user_ip_region = #{region}
+        where user_id = #{userId}
+    </update>
+
+</mapper>

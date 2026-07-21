@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.chome.mapper.PowerMapper">
+
+    <resultMap id="FurniturePowerResultMap" type="com.chome.domain.entity.FurniturePower">
+        <id     property="powerId"        column="power_id"/>
+        <result property="deviceId"       column="device_power_id"/>
+        <result property="n"              column="power_name"/>
+        <result property="v"              column="power_value"/>
+        <result property="u"              column="unit"/>
+        <result property="t"              column="power_type"/>
+        <result property="operationCode"  column="operation_code"/>
+        <result property="updateTime"     column="update_time"/>
+    </resultMap>
+
+    <update id="updatePowerByIdAndName">
+        update CHome_Furniture_Power
+        set power_value = #{v},
+            update_time = #{updateTime}
+        where device_power_id = #{deviceId}
+          and power_name = #{n}
+    </update>
+
+    <select id="queryByIdAndName" resultMap="FurniturePowerResultMap">
+        select power_id, device_power_id, power_name, power_value, unit, power_type, operation_code, update_time
+        from CHome_Furniture_Power
+        where device_power_id = #{deviceId}
+          and power_name = #{powerName}
+    </select>
+    <select id="getLocationNameByDeviceId" resultType="java.lang.String">
+        select l.room_name
+        from CHome_Furniture f
+                 left join CHome_Location l on f.location_id = l.id
+        where f.device_id = #{deviceId}
+    </select>
+
+    <insert id="batchInsertFurniturePower">
+        insert into CHome_Furniture_Power
+        (device_power_id, power_type, power_name, power_value, unit, operation_code, update_time)
+        values
+        <foreach collection="powers" item="power" separator=",">
+            (
+            #{power.deviceId},
+            #{power.t},
+            #{power.n},
+            #{power.v},
+            #{power.u},
+            #{power.operationCode},
+            #{power.updateTime}
+            )
+        </foreach>
+    </insert>
+
+</mapper>

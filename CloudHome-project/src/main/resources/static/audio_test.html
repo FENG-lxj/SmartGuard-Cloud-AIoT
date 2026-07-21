@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <title>语音对话测试（ASR → Chat → TTS） - 调试版</title>
+    <style>
+        body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 18px; }
+        button { margin: 6px; padding: 8px 12px; }
+        #logs { margin-top: 12px; white-space: pre-wrap; background:#f6f8fa;padding:12px;border-radius:6px;height:180px;overflow:auto;border:1px solid #e1e4e8 }
+        #transcripts { margin-top:8px; border:1px dashed #ddd; padding:8px; min-height:40px; }
+        #tts-controls { margin-top:8px; }
+        pre { white-space: pre-wrap; word-break: break-word; }
+        .col { display:inline-block; vertical-align:top; width:48%; }
+    </style>
+</head>
+<body>
+<h2>语音对话测试页（ASR → Chat → TTS） - 调试版</h2>
+<p>流程：Start Session → Start Speaking（开始录音）→ Stop Speaking（结束并发送 end）→ 后端返回 TTS 流</p>
+
+<div>
+    <button id="btnStartSession">Start Session</button>
+    <button id="btnStartSpeaking" disabled>Start Speaking</button>
+    <button id="btnStopSpeaking" disabled>Stop Speaking</button>
+    <button id="btnEndSession" disabled>End Session</button>
+</div>
+
+<div id="status" style="margin-top:10px">状态: 未连接</div>
+
+<div style="margin-top:12px">
+    <div class="col">
+        <h3>ASR 文本</h3>
+        <div id="transcripts"></div>
+        <h3>日志</h3>
+        <div id="logs"></div>
+    </div>
+    <div class="col" style="margin-left:2%">
+        <h3>音频分片调试（收到后端）</h3>
+        <pre id="pcm-log" style="border:1px solid #ddd;background:#fafafa;height:220px;overflow:auto;padding:8px;font-size:13px"></pre>
+
+        <h3>发送分片调试（发到后端）</h3>
+        <pre id="send-log" style="border:1px solid #ddd;background:#fff;height:220px;overflow:auto;padding:8px;font-size:13px"></pre>
+    </div>
+</div>
+
+<div id="tts-controls">
+    <button id="btnReplayTts" disabled>重新播放最近 TTS</button>
+    <button id="btnDownloadTts" disabled>下载最近 TTS</button>
+</div>
+
+<script>
+    (async () => {
+        // ====== 配置 ======
+        const wsUrl = 'ws://localhost:8023/ws/audio'; // 根据后端修改
+        let ws = null;
+        let wsReady = false;
+
+        // capture
+        let audioContext = null;
+        let sourceNode = null;
+        let processor = null;
+        let micStream = null;
+        let sending = false;
+
+        // tts 收集
+        let collectingTts = false;
+        let ttsChunks = [];
+        let lastTtsSampleRate = 24000;
+        let lastTtsBlobUrl = null;
+
+        // 音频对齐 carry
+        let oddByteCarry = null;
+
+        // 日志/UI 元素
+        const btnStartSession = document.getElementById('btnStartSession');
+        const btnStartSpeaking = document.getElementById('btnStartSpeaking');
+        const btnStopSpeaking = document.getElementById('btnStopSpeaking');
+        const btnEndSession = document.getElementById('btnEndSession');
+        const statusEl = document.getElementById('status');
+        const logsEl = document.getElementById('logs');
+        const transcriptsEl = document.getElementById('transcripts');
+        const pcmLogEl = document.getElementById('pcm-log');
+        const sendLogEl = document.getElementById('send-log');
+        const btnReplayTts = document.getElementById('btnReplayTts');
+        const btnDownloadTts = document.getElementById('btnDownloadTts');
+
+        function log(...args) {
+            logsEl.textContent += '[' + new Date().toLocaleTimeString() + '] ' + args.join(' ') + '\n';
+            logsEl.scrollTop = logsEl.scrollHeight;
+        }
+
+        // ----- 分片调试计数 -----
+        let recvCounter = 0;
+        let recvTotal = 0;
+        let sendCounter = 0;
+        let sendTotal = 0;
+
+        function logPacketInfoRecv(size) {
+            recvCounter++;
+            recvTotal += size;
+            const s = `#${recvCounter}\tsize=${size}\ttotal=${recvTotal}\tt=${performance.now().toFixed(1)}ms`;
+            pcmLogEl.textContent = s + '\n' + pcmLogEl.textContent;
+            console.debug('[RECV_PCM]', s);
+        }
+        function logPacketInfoSend(size) {
+            sendCounter++;
+            sendTotal += size;
+            const s = `#${sendCounter}\tsize=${size}\ttotal=${sendTotal}\tt=${performance.now().toFixed(1)}ms`;
+            sendLogEl.textContent = s + '\n' + sendLogEl.textContent;
+            console.debug('[SEND_PCM]', s);
+        }
+
+        // ====== 音频处理工具函数（来自你原代码） ======
+        function concatArrayBuffers(arr) {
+            if (!arr || arr.length === 0) return new ArrayBuffer(0);
+            let total = 0;
+            for (const a of arr) total += a.byteLength;
+            const res = new Uint8Array(total);
+            let offset = 0;
+            for (const a of arr) {
+                res.set(new Uint8Array(a), offset);
+                offset += a.byteLength;
+            }
+            return res.buffer;
+        }
+
+        function pcm16ToFloat32Array(pcmBuf) {
+            const dv = new DataView(pcmBuf);
+            const n = Math.floor(pcmBuf.byteLength / 2);
+            const out = new Float32Array(n);
+            for (let i = 0; i < n; i++) out[i] = dv.getInt16(i*2, true) / 32768;
+            return out;
+        }
+
+        function linearResampleInt16ToFloat32(pcmArrayBuffer, srcRate, dstRate) {
+            const srcLen = Math.floor(pcmArrayBuffer.byteLength / 2);
+            if (srcLen === 0) return new Float32Array(0);
+            const input = pcm16ToFloat32Array(pcmArrayBuffer);
+            if (srcRate === dstRate) return input;
+            const outLen = Math.round(input.length * dstRate / srcRate);
+            const out = new Float32Array(outLen);
+            const ratio = (input.length - 1) / (outLen - 1);
+            for (let i = 0; i < outLen; i++) {
+                const pos = i * ratio;
+                const i0 = Math.floor(pos);
+                const i1 = Math.min(i0 + 1, input.length - 1);
+                const frac = pos - i0;
+                out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+            }
+            return out;
+        }
+
+        function ensureAudioCtx() {
+            if (!window.__TTS_PLAY) window.__TTS_PLAY = { audioCtx: null, queuePlaying: false, mergeBuf: [], mergeBytes: 0, flushTimer: null, MIN_PLAY_BYTES: Math.ceil(24000 * 2 * 0.12) };
+            if (!window.__TTS_PLAY.audioCtx) {
+                window.__TTS_PLAY.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                console.log('🔊 audioContext.sampleRate =', window.__TTS_PLAY.audioCtx.sampleRate);
+            }
+            return window.__TTS_PLAY.audioCtx;
+        }
+
+        function pcm16ArrayBufferToAudioBuffer(pcmArrayBuffer, srcRate = 24000) {
+            const audioCtx = ensureAudioCtx();
+            const targetRate = audioCtx.sampleRate;
+            const float32 = linearResampleInt16ToFloat32(pcmArrayBuffer, srcRate, targetRate);
+            const buf = audioCtx.createBuffer(1, float32.length, targetRate);
+            buf.getChannelData(0).set(float32);
+            return buf;
+        }
+
+        // 采用调度播放（避免 await onended 导致不连续）
+        let playTime = 0;
+        function enqueuePlayAudioBuffer(audioBuffer) {
+            const ctx = ensureAudioCtx();
+            const src = ctx.createBufferSource();
+            src.buffer = audioBuffer;
+            src.connect(ctx.destination);
+            if (playTime < ctx.currentTime) playTime = ctx.currentTime + 0.05; // 50ms 预留
+            src.start(playTime);
+            playTime += audioBuffer.duration;
+        }
+
+        // 简单合并并调用 enqueuePlayAudioBuffer
+        function flushMergedBufferAndPlay(arrUint8, srcSampleRate = 24000) {
+            if (!arrUint8 || arrUint8.length === 0) return;
+            const merged = (arrUint8.length === 1) ? arrUint8[0].buffer : concatArrayBuffers(arrUint8.map(u=>u.buffer));
+            try {
+                const audioBuf = pcm16ArrayBufferToAudioBuffer(merged, srcSampleRate);
+                enqueuePlayAudioBuffer(audioBuf);
+                log('▶️ 播放合并块 bytes=' + merged.byteLength);
+            } catch (e) {
+                console.warn('播放失败', e);
+                log('播放失败: ' + e);
+            }
+        }
+
+        // PCM -> WAV blob
+        function pcm16ToWavBlob(pcmArrayBuffer, sampleRate = 24000) {
+            const pcmBytes = new Uint8Array(pcmArrayBuffer);
+            const dataSize = pcmBytes.byteLength;
+            const bytesPerSample = 2;
+            const numChannels = 1;
+            const blockAlign = numChannels * bytesPerSample;
+            const byteRate = sampleRate * blockAlign;
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+            function writeString(offset, str) {
+                for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+            }
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, dataSize, true);
+            const dst = new Uint8Array(buffer, 44);
+            dst.set(pcmBytes);
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
+
+        function enableTtsButtons(pcmArrayBuffer, sampleRate = 24000) {
+            const wav = pcm16ToWavBlob(pcmArrayBuffer, sampleRate);
+            if (lastTtsBlobUrl) URL.revokeObjectURL(lastTtsBlobUrl);
+            lastTtsBlobUrl = URL.createObjectURL(wav);
+            btnDownloadTts.disabled = false;
+            btnReplayTts.disabled = false;
+
+            btnDownloadTts.onclick = () => {
+                const a = document.createElement('a');
+                a.href = lastTtsBlobUrl;
+                a.download = 'tts.wav';
+                a.click();
+            };
+            btnReplayTts.onclick = async () => {
+                if (!lastTtsBlobUrl) return;
+                const audio = new Audio(lastTtsBlobUrl);
+                try { await audio.play(); log('🔁 重新播放开始'); } catch(e) { log('播放失败: ' + e); }
+            };
+        }
+
+        // ====== WebSocket 管理 ======
+        function openWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) return;
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = () => {
+                wsReady = true;
+                statusEl.textContent = '状态: 已连接';
+                btnStartSpeaking.disabled = false;
+                btnEndSession.disabled = false;
+                log('✅ WebSocket 已连接 ' + wsUrl);
+            };
+            ws.onmessage = async (ev) => {
+                try {
+                    if (typeof ev.data === 'string') {
+                        // JSON 文本或控制消息
+                        try {
+                            const obj = JSON.parse(ev.data);
+                            if (obj.type === 'transcript' && obj.text) {
+                                const d = document.createElement('div');
+                                d.textContent = obj.text;
+                                transcriptsEl.appendChild(d);
+                                log('🗣️ ASR: ' + obj.text);
+                            } else if (obj.type === 'tts_start') {
+                                collectingTts = true; ttsChunks = []; lastTtsSampleRate = obj.sampleRate || 24000;
+                                log('🔊 收到 tts_start sampleRate=' + lastTtsSampleRate);
+                            } else if (obj.type === 'tts_end') {
+                                collectingTts = false;
+                                log('🔊 收到 tts_end 合并块数=' + ttsChunks.length);
+                                const all = concatArrayBuffers(ttsChunks);
+                                enableTtsButtons(all, lastTtsSampleRate);
+                            } else {
+                                log('📨 文本消息: ' + ev.data);
+                            }
+                        } catch(e) {
+                            log('⚠️ 文本消息（非 JSON）: ' + ev.data);
+                        }
+                    } else if (ev.data instanceof ArrayBuffer) {
+                        const buf = ev.data;
+                        // 简单检测是否为控制短文本以二进制方式发送
+                        let isControl = false;
+                        if (buf.byteLength <= 32) {
+                            try {
+                                const txt = new TextDecoder().decode(buf);
+                                if (txt && (txt.indexOf('tts_start') !== -1 || txt.indexOf('tts_end') !== -1)) {
+                                    isControl = true;
+                                    if (txt.indexOf('tts_start') !== -1) {
+                                        collectingTts = true; ttsChunks = []; lastTtsSampleRate = 24000;
+                                        log('🔊 收到 tts_start (binary text)');
+                                    } else if (txt.indexOf('tts_end') !== -1) {
+                                        collectingTts = false;
+                                        log('🔊 收到 tts_end (binary text) 合并块数=' + ttsChunks.length);
+                                        const all = concatArrayBuffers(ttsChunks);
+                                        enableTtsButtons(all, lastTtsSampleRate);
+                                    }
+                                }
+                            } catch(e){}
+                        }
+                        if (isControl) return;
+
+                        // 正常 PCM 分片
+                        log('📦 收到二进制分片 bytes=' + buf.byteLength + (collectingTts ? ' (收集中)' : ''));
+                        logPacketInfoRecv(buf.byteLength);
+                        if (collectingTts) {
+                            ttsChunks.push(buf);
+                        }
+                        // 同时把片段合并后播放（实时播放）——简单调用 flushMergedBufferAndPlay（把每个片段作为单个合并单元）
+                        try {
+                            flushMergedBufferAndPlay([new Uint8Array(buf)], lastTtsSampleRate);
+                        } catch(e) { console.warn('播放片段失败', e); }
+                    } else {
+                        log('未知消息类型: ' + Object.prototype.toString.call(ev.data));
+                    }
+                } catch (err) {
+                    console.error('onmessage error', err);
+                }
+            };
+            ws.onerror = (e) => { log('❌ WebSocket 错误 ' + e); };
+            ws.onclose = () => {
+                wsReady = false;
+                statusEl.textContent = '状态: 已断开';
+                btnStartSpeaking.disabled = true;
+                btnStopSpeaking.disabled = true;
+                btnEndSession.disabled = true;
+                log('🔌 WebSocket 已关闭');
+                stopCapture();
+            };
+        }
+
+        function sendControl(action) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) { log('⚠️ WebSocket 未连接，无法发送控制消息'); return; }
+            const payload = (action === 'start') ? { start: true } : (action === 'end') ? { end: true } : (action === 'session_end') ? { session_end: true } : {};
+            ws.send(JSON.stringify(payload));
+            log('📤 发送控制消息: ' + JSON.stringify(payload));
+        }
+
+        // ====== 录音采集并发送 ======
+        function downsampleBuffer(buffer, srcRate, targetRate) {
+            if (targetRate === srcRate) return buffer;
+            const ratio = srcRate / targetRate;
+            const newLength = Math.floor(buffer.length / ratio);
+            const result = new Float32Array(newLength);
+            for (let i = 0; i < newLength; i++) {
+                const srcPos = i * ratio;
+                const i0 = Math.floor(srcPos);
+                const i1 = Math.min(i0 + 1, buffer.length - 1);
+                const frac = srcPos - i0;
+                result[i] = buffer[i0] * (1 - frac) + buffer[i1] * frac;
+            }
+            return result;
+        }
+
+        function floatTo16BitPCM(float32Array) {
+            let max = 0;
+            for (let i = 0; i < float32Array.length; i++) {
+                const v = Math.abs(float32Array[i]);
+                if (v > max) max = v;
+            }
+            let norm = 1.0;
+            if (max > 0 && max < 0.2) norm = Math.min(1.0 / max * 0.6, 10);
+            const buffer = new ArrayBuffer(float32Array.length * 2);
+            const view = new DataView(buffer);
+            for (let i = 0, offset = 0; i < float32Array.length; i++, offset += 2) {
+                let s = float32Array[i] * norm;
+                s = Math.max(-1, Math.min(1, s));
+                view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+            return buffer;
+        }
+
+        async function startCaptureAndSend() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) { log('⚠️ WebSocket 未连接，先 Start Session'); return; }
+            if (sending) return;
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                sourceNode = audioContext.createMediaStreamSource(micStream);
+                // ScriptProcessor -> 跨浏览器兼容（简单实现）
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                const inputSampleRate = audioContext.sampleRate;
+                log('🎙️ 当前采样率: ' + inputSampleRate);
+                processor.onaudioprocess = (e) => {
+                    if (!sending) return;
+                    try {
+                        const input = e.inputBuffer.getChannelData(0);
+                        const down = downsampleBuffer(input, inputSampleRate, 24000);
+                        const pcm16buf = floatTo16BitPCM(down);
+                        // 记录发送日志
+                        logPacketInfoSend(pcm16buf.byteLength);
+                        // 发送到后端（ArrayBuffer）
+                        if (ws && ws.readyState === WebSocket.OPEN) ws.send(pcm16buf);
+                    } catch (err) {
+                        console.error('音频处理出错:', err);
+                    }
+                };
+                sourceNode.connect(processor);
+                // 不要把 processor 连接到 destination（会造成回声），只要连到 audioContext 为了触发 onaudioprocess
+                processor.connect(audioContext.destination);
+                sending = true;
+                btnStartSpeaking.disabled = true;
+                btnStopSpeaking.disabled = false;
+                log('🎤 开始采集并发送音频');
+            } catch (e) {
+                log('❌ 启动采集失败: ' + e);
+            }
+        }
+
+        function stopCapture() {
+            try {
+                if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
+                if (sourceNode) { try { sourceNode.disconnect(); } catch (e) {} sourceNode = null; }
+                if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+                if (audioContext) { try { audioContext.close(); } catch (e) {} audioContext = null; }
+            } finally {
+                sending = false;
+                btnStartSpeaking.disabled = false;
+                btnStopSpeaking.disabled = true;
+                log('🛑 停止采集');
+            }
+        }
+
+        // ====== 按钮事件绑定 ======
+        btnStartSession.addEventListener('click', () => {
+            openWebSocket();
+            btnStartSession.disabled = true;
+            log('尝试连接 WebSocket...');
+        });
+
+        btnStartSpeaking.addEventListener('click', async () => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) { log('⚠️ 请先 Start Session'); return; }
+            sendControl('start'); // 告诉后端开始 ASR（可选）
+            await startCaptureAndSend();
+        });
+
+        btnStopSpeaking.addEventListener('click', () => {
+            stopCapture();
+            sendControl('end'); // 告诉后端结束输入，触发后端 ASR/NLP/TTS 流程
+        });
+
+        btnEndSession.addEventListener('click', () => {
+            sendControl('session_end');
+            if (ws) try { ws.close(); } catch(e) {}
+            ws = null;
+            btnStartSession.disabled = false;
+            log('会话结束');
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) try { ws.close(); } catch(e) {}
+            stopCapture();
+        });
+
+        // 初始提示
+        log('✅ 前端准备就绪：可开始测试 ASR→Chat→TTS 流程（先点击 Start Session）');
+    })();
+</script>
+</body>
+</html>
